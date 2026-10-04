@@ -1,0 +1,27 @@
+# Dependencies and build output
+node_modules/
+*.js
+!jest.config.js
+*.d.ts
+*.tsbuildinfo
+cdk.out/
+coverage/
+
+# CDK context caches account/region lookups: never commit
+cdk.context.json
+
+# Environment-specific configuration: never commit real values.
+# Only the documented example template is tracked.
+config/*.json
+!config/config.example.json
+
+# Local environment files and credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Evaluation sets and results describe your corpus: keep them local.
+eval/*.jsonl
+!eval/questions.example.jsonl
+eval/results/

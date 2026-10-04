@@ -1,0 +1,103 @@
+{
+  "$comment": "Template only. Copy to config/<env>.json (git-ignored) and replace placeholders. Never commit real account ids, emails or domain prefixes.",
+  "projectName": "kb-pilot",
+  "envName": "dev",
+  "region": "eu-west-2",
+  "removalPolicy": "destroy",
+  "documents": {
+    "prefix": "documents/",
+    "noncurrentVersionExpirationDays": 30,
+    "writerPrincipalArns": []
+  },
+  "knowledgeBase": {
+    "embeddingModelId": "amazon.titan-embed-text-v2:0",
+    "embeddingDimensions": 1024,
+    "distanceMetric": "cosine",
+    "chunking": {
+      "strategy": "FIXED_SIZE",
+      "maxTokens": 300,
+      "overlapPercentage": 20
+    },
+    "dataDeletionPolicy": "DELETE"
+  },
+  "ingestion": {
+    "eventDriven": true,
+    "batchWindowSeconds": 60,
+    "scheduleExpression": "rate(1 day)",
+    "trackingTtlDays": 30
+  },
+  "api": {
+    "cognitoDomainPrefix": "replace-with-unique-prefix",
+    "resourceServerIdentifier": "kb-api",
+    "clients": [
+      {
+        "name": "gateway",
+        "scopes": [
+          "retrieve"
+        ],
+        "accessGroups": [
+          "general",
+          "finance",
+          "hr"
+        ],
+        "delegating": true
+      },
+      {
+        "name": "eval-runner",
+        "scopes": [
+          "retrieve"
+        ],
+        "accessGroups": [
+          "general"
+        ]
+      }
+    ],
+    "accessTokenValidityMinutes": 60,
+    "throttleRateLimit": 10,
+    "throttleBurstLimit": 20,
+    "reservedConcurrency": 10,
+    "maxQueryLength": 1000,
+    "maxResults": 10,
+    "allowedFilterKeys": [
+      "department",
+      "doc_type"
+    ],
+    "executionLogging": false,
+    "waf": {
+      "enabled": true,
+      "rateLimitPer5Min": 500
+    },
+    "maxTokenBudget": 4000,
+    "mcpEnabled": true
+  },
+  "generation": {
+    "enabled": false,
+    "allowedInferenceGeographies": [
+      "eu"
+    ]
+  },
+  "access": {
+    "mode": "groups",
+    "metadataKey": "access_group",
+    "groups": [
+      "general",
+      "finance",
+      "hr"
+    ]
+  },
+  "audit": {
+    "enabled": true,
+    "failClosed": true,
+    "archiveRetentionDays": 400
+  },
+  "network": {
+    "enableVpc": false
+  },
+  "observability": {
+    "logRetentionDays": 90,
+    "logQueries": false
+  },
+  "tags": {
+    "DataClassification": "internal"
+  }
+}
