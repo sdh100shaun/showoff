@@ -11,6 +11,7 @@ import { Network } from './constructs/network';
 import { QueryApi } from './constructs/query-api';
 import { VectorStore } from './constructs/vector-store';
 import { applyNagSuppressions } from './nag-suppressions';
+import { AuditTrail } from './constructs/audit-trail';
 
 export interface KbStackProps extends StackProps {
   readonly config: KbConfig;
@@ -24,6 +25,7 @@ export class KbStack extends Stack {
   public readonly ingestion: Ingestion;
   public readonly queryApi: QueryApi;
   public readonly network?: Network;
+  public readonly audit?: AuditTrail;
 
   constructor(scope: Construct, id: string, props: KbStackProps) {
     super(scope, id, props);
@@ -46,6 +48,7 @@ export class KbStack extends Stack {
         key,
         logRetention,
         removalPolicy,
+        eventBridgeEndpoint: config.audit.enabled,
       });
     }
     const vpcPlacement = this.network ? { vpc: this.network.vpc, securityGroup: this.network.lambdaSecurityGroup } : {};
@@ -73,7 +76,6 @@ export class KbStack extends Stack {
       settings: config.knowledgeBase,
       description: `${config.projectName} ${config.envName} knowledge base`,
     });
-    this.network?.restrictEndpointsTo(this.kb.knowledgeBaseArn);
 
     this.ingestion = new Ingestion(this, 'Ingestion', {
       key,
@@ -88,12 +90,24 @@ export class KbStack extends Stack {
       ...vpcPlacement,
     });
 
+    if (config.audit.enabled) {
+      this.audit = new AuditTrail(this, 'AuditTrail', { key, archiveRetentionDays: config.audit.archiveRetentionDays, removalPolicy });
+    }
+
+    this.network?.restrictEndpointsTo({
+      knowledgeBaseArn: this.kb.knowledgeBaseArn,
+      trackingTableArn: this.ingestion.trackingTable.tableArn,
+      auditBusArn: this.audit?.bus.eventBusArn,
+    });
+
     this.queryApi = new QueryApi(this, 'QueryApi', {
       key,
       knowledgeBaseId: this.kb.knowledgeBase.attrKnowledgeBaseId,
       knowledgeBaseArn: this.kb.knowledgeBaseArn,
       api: config.api,
       generation: config.generation,
+      access: config.access,
+      audit: this.audit ? { trail: this.audit, failClosed: config.audit.failClosed } : undefined,
       logQueries: config.observability.logQueries,
       logRetention,
       removalPolicy,
@@ -112,6 +126,9 @@ export class KbStack extends Stack {
     new CfnOutput(this, 'DocumentBucketName', { value: this.documents.bucket.bucketName, description: `Upload documents under s3://<bucket>/${config.documents.prefix}` });
     new CfnOutput(this, 'KnowledgeBaseId', { value: this.kb.knowledgeBase.attrKnowledgeBaseId });
     new CfnOutput(this, 'DataSourceId', { value: this.kb.dataSource.attrDataSourceId });
+    if (this.audit) {
+      new CfnOutput(this, 'AuditBusName', { value: this.audit.bus.eventBusName, description: 'Subscribe the gateway audit store to ContextServed events here' });
+    }
 
     applyNagSuppressions(this, config);
   }

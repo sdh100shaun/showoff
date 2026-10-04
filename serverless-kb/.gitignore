@@ -20,3 +20,8 @@ config/*.json
 .env.*
 *.pem
 *.key
+
+# Evaluation sets and results describe your corpus: keep them local.
+eval/*.jsonl
+!eval/questions.example.jsonl
+eval/results/

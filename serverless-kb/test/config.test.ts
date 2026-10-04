@@ -54,6 +54,25 @@ describe('loadConfig', () => {
     expect(cfg.api.cognitoDomainPrefix).toBe('my-prefix');
   });
 
+  test('EU inference profiles are allowed by default; others only when opted in', () => {
+    const eu = { ...exampleConfig(), generation: { enabled: true, inferenceProfile: true, modelId: 'eu.vendor.model-v1:0' } };
+    expect(loadConfig({ configFile: writeConfig(eu), env: {} }).generation.modelId).toBe('eu.vendor.model-v1:0');
+    const global = {
+      ...exampleConfig(),
+      generation: { enabled: true, inferenceProfile: true, modelId: 'global.vendor.model-v1:0', allowedInferenceGeographies: ['eu', 'global'] },
+    };
+    expect(() => loadConfig({ configFile: writeConfig(global), env: {} })).not.toThrow();
+  });
+
+  test('open access mode needs no groups (single trust domain)', () => {
+    const open = {
+      ...exampleConfig(),
+      access: { mode: 'open' },
+      api: { ...(exampleConfig().api as object), clients: [{ name: 'agent-x', scopes: ['retrieve'] }] },
+    };
+    expect(loadConfig({ configFile: writeConfig(open), env: {} }).access.mode).toBe('open');
+  });
+
   test.each([
     ['unknown top-level key', { surprise: true }, /Unrecognized key|unrecognized/i],
     ['bad account', { account: '123' }, /12-digit/],
@@ -65,6 +84,12 @@ describe('loadConfig', () => {
     ['guardrail id without version', { generation: { guardrailId: 'abc' } }, /set together/],
     ['invalid log retention', { observability: { logRetentionDays: 42 } }, /logRetentionDays/],
     ['bad filter key', { api: { ...(exampleConfig().api as object), allowedFilterKeys: ['bad key!'] } }, /metadata keys/],
+    ['groups mode without groups', { access: { mode: 'groups', groups: [] } }, /at least one access group/],
+    ['client with an unknown group', { access: { groups: ['general'] } }, /unknown access group "finance"/],
+    ['client without groups', { api: { ...(exampleConfig().api as object), clients: [{ name: 'agent-x', scopes: ['retrieve'] }] } }, /each client needs at least one access group/],
+    ['the access key as a caller filter', { api: { ...(exampleConfig().api as object), allowedFilterKeys: ['access_group'] } }, /enforced from the token/],
+    ['a global inference profile by default', { generation: { enabled: true, inferenceProfile: true, modelId: 'global.vendor.model-v1:0' } }, /data residency/],
+    ['a US inference profile by default', { generation: { enabled: true, inferenceProfile: true, modelId: 'us.vendor.model-v1:0' } }, /data residency/],
   ])('rejects %s', (_name, override, message) => {
     const file = writeConfig({ ...exampleConfig(), ...override });
     expect(() => loadConfig({ configFile: file, env: {} })).toThrow(message);

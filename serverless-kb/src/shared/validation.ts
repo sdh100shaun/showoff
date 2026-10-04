@@ -1,37 +1,14 @@
 import type { RetrievalFilter } from '@aws-sdk/client-bedrock-agent-runtime';
 import { z } from 'zod';
-
-export interface QuerySettings {
-  maxQueryLength: number;
-  maxResults: number;
-  allowedFilterKeys: string[];
-}
-
-const intFromEnv = (name: string, value: string | undefined, min: number, max: number): number => {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`Invalid ${name}`);
-  return n;
-};
-
-/** Reads and validates handler settings from the environment once per cold start. */
-export function settingsFromEnv(env: NodeJS.ProcessEnv): QuerySettings {
-  return {
-    maxQueryLength: intFromEnv('MAX_QUERY_LENGTH', env.MAX_QUERY_LENGTH, 1, 8000),
-    maxResults: intFromEnv('MAX_RESULTS', env.MAX_RESULTS, 1, 100),
-    allowedFilterKeys: (env.ALLOWED_FILTER_KEYS ?? '')
-      .split(',')
-      .map((k) => k.trim())
-      .filter(Boolean),
-  };
-}
+import type { Settings } from '../core/settings';
 
 const filterValue = z.union([z.string().max(256), z.array(z.string().max(256)).min(1).max(10)]);
 
 /**
  * Request schema. Mirrors the API Gateway model so the Lambda is safe even if
- * invoked another way (defence in depth).
+ * invoked another way (defence in depth), and validates MCP tool arguments.
  */
-export function requestSchema(s: QuerySettings) {
+export function requestSchema(s: Pick<Settings, 'maxQueryLength' | 'maxResults' | 'maxTokenBudget' | 'allowedFilterKeys'>) {
   const allowed = new Set(s.allowedFilterKeys);
   const filter =
     s.allowedFilterKeys.length > 0
@@ -46,6 +23,8 @@ export function requestSchema(s: QuerySettings) {
     .object({
       query: z.string().trim().min(1).max(s.maxQueryLength),
       maxResults: z.number().int().min(1).max(s.maxResults).optional(),
+      /** Context budget: results are trimmed (highest score first) to fit. */
+      maxTokens: z.number().int().min(1).max(s.maxTokenBudget).optional(),
       filter,
     })
     .strict();
@@ -53,12 +32,25 @@ export function requestSchema(s: QuerySettings) {
 
 export type QueryRequest = z.infer<ReturnType<typeof requestSchema>>;
 
-/** Converts `{ key: "v" | ["a","b"] }` into a Bedrock retrieval filter. */
-export function toRetrievalFilter(filter: Record<string, string | string[]> | undefined): RetrievalFilter | undefined {
-  if (!filter) return undefined;
-  const clauses: RetrievalFilter[] = Object.entries(filter).map(([key, value]) =>
-    Array.isArray(value) ? { in: { key, value } } : { equals: { key, value } },
-  );
+/** Issues as "path: message", never echoing input values. */
+export function describeIssues(error: z.ZodError): string[] {
+  return error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`);
+}
+
+/**
+ * Builds the Bedrock filter: the mandatory access-group clause (if any) AND the
+ * caller's own filters. The access clause cannot be overridden because the
+ * access key is never an allowed caller filter key (enforced in config).
+ */
+export function buildFilter(
+  access: { metadataKey: string; groups: string[] } | undefined,
+  filter: Record<string, string | string[]> | undefined,
+): RetrievalFilter | undefined {
+  const clauses: RetrievalFilter[] = [];
+  if (access) clauses.push({ in: { key: access.metadataKey, value: access.groups } });
+  for (const [key, value] of Object.entries(filter ?? {})) {
+    clauses.push(Array.isArray(value) ? { in: { key, value } } : { equals: { key, value } });
+  }
   if (clauses.length === 0) return undefined;
   return clauses.length === 1 ? clauses[0] : { andAll: clauses };
 }

@@ -15,6 +15,10 @@ export function json(statusCode: number, body: unknown, requestId?: string): API
   };
 }
 
+export function empty(statusCode: number, requestId?: string): APIGatewayProxyResult {
+  return { ...json(statusCode, null, requestId), body: '' };
+}
+
 /** Error response that never includes internal details. */
 export function error(statusCode: number, message: string, requestId?: string, details?: string[]): APIGatewayProxyResult {
   return json(statusCode, { message, ...(details?.length ? { details } : {}), ...(requestId ? { requestId } : {}) }, requestId);

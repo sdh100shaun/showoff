@@ -1,4 +1,5 @@
-import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy, Stack } from 'aws-cdk-lib';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
@@ -38,6 +39,7 @@ export class Ingestion extends Construct {
   public readonly queue: sqs.Queue;
   public readonly deadLetterQueue: sqs.Queue;
   public readonly function: SecureFunction;
+  public readonly trackingTable: dynamodb.TableV2;
 
   constructor(scope: Construct, id: string, props: IngestionProps) {
     super(scope, id);
@@ -85,6 +87,18 @@ export class Ingestion extends Construct {
       });
     }
 
+    // Idempotency keys and job tracking: which change events each ingestion job
+    // covered. Items expire via TTL.
+    this.trackingTable = new dynamodb.TableV2(this, 'TrackingTable', {
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      encryption: dynamodb.TableEncryptionV2.customerManagedKey(props.key),
+      timeToLiveAttribute: 'expiresAt',
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      deletionProtection: props.removalPolicy === RemovalPolicy.RETAIN,
+      removalPolicy: props.removalPolicy,
+    });
+
     this.function = new SecureFunction(this, 'Trigger', {
       handler: 'ingest',
       description: 'Starts Bedrock knowledge base ingestion jobs from queued change events',
@@ -96,6 +110,8 @@ export class Ingestion extends Construct {
       environment: {
         KNOWLEDGE_BASE_ID: props.knowledgeBaseId,
         DATA_SOURCE_ID: props.dataSourceId,
+        TRACKING_TABLE_NAME: this.trackingTable.tableName,
+        TRACKING_TTL_DAYS: String(settings.trackingTtlDays),
         POWERTOOLS_SERVICE_NAME: 'kb-ingest',
       },
       vpc: props.vpc,
@@ -106,6 +122,22 @@ export class Ingestion extends Construct {
       new iam.PolicyStatement({
         actions: ['bedrock:StartIngestionJob', 'bedrock:ListIngestionJobs'],
         resources: [props.knowledgeBaseArn],
+      }),
+    );
+
+    this.function.fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'TrackProcessedChanges',
+        actions: ['dynamodb:BatchGetItem', 'dynamodb:BatchWriteItem'],
+        resources: [this.trackingTable.tableArn],
+      }),
+    );
+    this.function.fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: 'UseKeyViaDynamoDb',
+        actions: ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKey', 'kms:DescribeKey'],
+        resources: [props.key.keyArn],
+        conditions: { StringEquals: { 'kms:ViaService': `dynamodb.${Stack.of(this).region}.amazonaws.com` } },
       }),
     );
 

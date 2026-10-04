@@ -7,7 +7,8 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
-import { KbConfig } from '../config';
+import { baseModelId, KbConfig } from '../config';
+import { AuditTrail } from './audit-trail';
 import { SecureFunction } from './secure-function';
 
 export interface QueryApiProps {
@@ -16,6 +17,8 @@ export interface QueryApiProps {
   readonly knowledgeBaseArn: string;
   readonly api: KbConfig['api'];
   readonly generation: KbConfig['generation'];
+  readonly access: KbConfig['access'];
+  readonly audit?: { trail: AuditTrail; failClosed: boolean };
   readonly logQueries: boolean;
   readonly logRetention: logs.RetentionDays;
   readonly removalPolicy: RemovalPolicy;
@@ -26,10 +29,12 @@ export interface QueryApiProps {
 type Scope = 'retrieve' | 'ask';
 
 /**
- * Public, authenticated retrieval API for agents and services.
+ * Authenticated retrieval API for the gateway, orchestrator and agents.
  *
  * Callers obtain an OAuth2 access token with the client-credentials grant from
- * Cognito and call API Gateway with it. Each route requires its own scope.
+ * Cognito and call API Gateway with it. Each route requires its own scope, and
+ * `group:<name>` scopes set the ceiling of access groups the client may read.
+ * Routes: POST /retrieve, POST /ask (optional), POST /mcp (MCP Streamable HTTP).
  * WAF, throttling and request validation sit in front of the Lambda.
  */
 export class QueryApi extends Construct {
@@ -69,9 +74,19 @@ export class QueryApi extends Construct {
       retrieve: new cognito.ResourceServerScope({ scopeName: 'retrieve', scopeDescription: 'Retrieve context chunks' }),
       ask: new cognito.ResourceServerScope({ scopeName: 'ask', scopeDescription: 'Generate grounded answers' }),
     };
+    // One scope per access group: the token itself carries the client's group ceiling.
+    const groupScopes = new Map(
+      (props.access.mode === 'groups' ? props.access.groups : []).map((g) => [
+        g,
+        new cognito.ResourceServerScope({ scopeName: `group:${g}`, scopeDescription: `Read documents in access group ${g}` }),
+      ]),
+    );
+    const delegatedScope = api.clients.some((c) => c.delegating)
+      ? new cognito.ResourceServerScope({ scopeName: 'delegated', scopeDescription: 'Acts for end users; identity headers required' })
+      : undefined;
     const resourceServer = this.userPool.addResourceServer('ResourceServer', {
       identifier: api.resourceServerIdentifier,
-      scopes: Object.values(scopes),
+      scopes: [...Object.values(scopes), ...groupScopes.values(), ...(delegatedScope ? [delegatedScope] : [])],
     });
 
     for (const client of api.clients) {
@@ -81,7 +96,11 @@ export class QueryApi extends Construct {
         authFlows: {},
         oAuth: {
           flows: { clientCredentials: true },
-          scopes: client.scopes.map((s) => cognito.OAuthScope.resourceServer(resourceServer, scopes[s])),
+          scopes: [
+            ...client.scopes.map((s) => cognito.OAuthScope.resourceServer(resourceServer, scopes[s])),
+            ...client.accessGroups.filter((g) => groupScopes.has(g)).map((g) => cognito.OAuthScope.resourceServer(resourceServer, groupScopes.get(g)!)),
+            ...(client.delegating && delegatedScope ? [cognito.OAuthScope.resourceServer(resourceServer, delegatedScope)] : []),
+          ],
         },
         accessTokenValidity: Duration.minutes(api.accessTokenValidityMinutes),
         enableTokenRevocation: true,
@@ -107,7 +126,12 @@ export class QueryApi extends Construct {
         KNOWLEDGE_BASE_ID: props.knowledgeBaseId,
         MAX_QUERY_LENGTH: String(api.maxQueryLength),
         MAX_RESULTS: String(api.maxResults),
+        MAX_TOKEN_BUDGET: String(api.maxTokenBudget),
         ALLOWED_FILTER_KEYS: api.allowedFilterKeys.join(','),
+        ACCESS_MODE: props.access.mode,
+        ACCESS_METADATA_KEY: props.access.metadataKey,
+        AUDIT_FAIL_CLOSED: String(props.audit?.failClosed ?? true),
+        ...(props.audit ? { AUDIT_BUS_NAME: props.audit.trail.bus.eventBusName } : {}),
         LOG_QUERIES: String(props.logQueries),
         REQUIRED_SCOPE_PREFIX: api.resourceServerIdentifier,
         POWERTOOLS_SERVICE_NAME: 'kb-query',
@@ -123,6 +147,7 @@ export class QueryApi extends Construct {
     this.function.fn.addToRolePolicy(
       new iam.PolicyStatement({ sid: 'RetrieveFromKnowledgeBase', actions: ['bedrock:Retrieve'], resources: [props.knowledgeBaseArn] }),
     );
+    props.audit?.trail.grantPublish(this.function.fn, props.key);
     if (generation.enabled && generation.modelId) {
       this.grantGeneration(stack, generation.modelId, generation.inferenceProfile, generation.guardrailId);
     }
@@ -208,6 +233,35 @@ export class QueryApi extends Construct {
       });
     route('retrieve', 'retrieve');
     if (generation.enabled) route('ask', 'ask');
+
+    if (api.mcpEnabled) {
+      // MCP Streamable HTTP. Any capability scope may connect; tools are
+      // filtered and enforced per scope inside the Lambda.
+      const mcpScopes = [`${api.resourceServerIdentifier}/retrieve`, ...(generation.enabled ? [`${api.resourceServerIdentifier}/ask`] : [])];
+      const mcpModel = this.restApi.addModel('McpRequest', {
+        contentType: 'application/json',
+        schema: {
+          schema: apigw.JsonSchemaVersion.DRAFT4,
+          title: 'McpRequest',
+          type: apigw.JsonSchemaType.OBJECT,
+          required: ['jsonrpc', 'method'],
+          properties: {
+            jsonrpc: { type: apigw.JsonSchemaType.STRING, enum: ['2.0'] },
+            method: { type: apigw.JsonSchemaType.STRING, maxLength: 128 },
+          },
+        },
+      });
+      const mcp = this.restApi.root.addResource('mcp');
+      mcp.addMethod('POST', integration, {
+        authorizer,
+        authorizationType: apigw.AuthorizationType.COGNITO,
+        authorizationScopes: mcpScopes,
+        requestValidator: validator,
+        requestModels: { 'application/json': mcpModel },
+      });
+      // Returns 405: this server offers no SSE stream (allowed by the spec).
+      mcp.addMethod('GET', integration, { authorizer, authorizationType: apigw.AuthorizationType.COGNITO, authorizationScopes: mcpScopes });
+    }
 
     // ----------------------------------------------------------------- waf
     if (api.waf.enabled) {
@@ -322,6 +376,7 @@ function requestSchema(api: KbConfig['api']): apigw.JsonSchema {
   const properties: Record<string, apigw.JsonSchema> = {
     query: { type: apigw.JsonSchemaType.STRING, minLength: 1, maxLength: api.maxQueryLength },
     maxResults: { type: apigw.JsonSchemaType.INTEGER, minimum: 1, maximum: api.maxResults },
+    maxTokens: { type: apigw.JsonSchemaType.INTEGER, minimum: 1, maximum: api.maxTokenBudget },
   };
   if (api.allowedFilterKeys.length > 0) {
     const value: apigw.JsonSchema = {
@@ -351,11 +406,6 @@ function generationModelArn(stack: Stack, modelId: string, inferenceProfile: boo
   return inferenceProfile
     ? `arn:${stack.partition}:bedrock:${stack.region}:${stack.account}:inference-profile/${modelId}`
     : `arn:${stack.partition}:bedrock:${stack.region}::foundation-model/${modelId}`;
-}
-
-/** "eu.vendor.model-v1:0" → "vendor.model-v1:0" */
-export function baseModelId(profileId: string): string {
-  return profileId.replace(/^(us|eu|apac|us-gov|ca|jp|au|global)\./, '');
 }
 
 function toPascal(s: string): string {

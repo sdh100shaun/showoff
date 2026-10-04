@@ -88,6 +88,66 @@ describe('KbStack (default configuration)', () => {
     template.resourcePropertiesCountIs('AWS::ApiGateway::Resource', { PathPart: 'ask' }, 0);
   });
 
+  test('access groups become OAuth scopes; clients get only their groups', () => {
+    template.hasResourceProperties('AWS::Cognito::UserPoolResourceServer', {
+      Identifier: 'kb-api',
+      Scopes: Match.arrayWith([Match.objectLike({ ScopeName: 'group:general' }), Match.objectLike({ ScopeName: 'group:hr' })]),
+    });
+    const clients = Object.values(template.findResources('AWS::Cognito::UserPoolClient'));
+    const scopesOf = (name: string) => JSON.stringify(clients.find((c) => c.Properties.ClientName === name)!.Properties.AllowedOAuthScopes);
+    expect(scopesOf('eval-runner')).toContain('/retrieve');
+    expect(scopesOf('eval-runner')).toContain('/group:general');
+    expect(scopesOf('eval-runner')).not.toContain('group:hr');
+    expect(scopesOf('gateway')).toContain('/group:hr');
+    expect(scopesOf('gateway')).toContain('/delegated');
+    expect(scopesOf('eval-runner')).not.toContain('/delegated');
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: { Variables: Match.objectLike({ ACCESS_MODE: 'groups', ACCESS_METADATA_KEY: 'access_group', MAX_TOKEN_BUDGET: '4000' }) },
+    });
+  });
+
+  test('MCP endpoint: POST and GET on /mcp with Cognito scopes', () => {
+    template.hasResourceProperties('AWS::ApiGateway::Resource', { PathPart: 'mcp' });
+    template.hasResourceProperties('AWS::ApiGateway::Method', { HttpMethod: 'POST', AuthorizationScopes: ['kb-api/retrieve'], RequestValidatorId: Match.anyValue() });
+    template.hasResourceProperties('AWS::ApiGateway::Method', { HttpMethod: 'GET', AuthorizationType: 'COGNITO_USER_POOLS' });
+  });
+
+  test('audit trail: KMS-encrypted bus and archive; query Lambda may only publish to it', () => {
+    template.hasResourceProperties('AWS::Events::EventBus', { Name: 'Test-audit', KmsKeyIdentifier: Match.anyValue() });
+    template.hasResourceProperties('AWS::Events::Archive', {
+      EventPattern: { source: ['kb.retrieval'], 'detail-type': ['ContextServed'] },
+      RetentionDays: 400,
+      KmsKeyIdentifier: Match.anyValue(),
+    });
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({ Action: 'events:PutEvents', Resource: Match.anyValue() }),
+          Match.objectLike({ Sid: 'UseKeyForAuditBus', Condition: { StringEquals: Match.objectLike({}) } }),
+        ]),
+      },
+    });
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: { Variables: Match.objectLike({ AUDIT_BUS_NAME: Match.anyValue(), AUDIT_FAIL_CLOSED: 'true' }) },
+    });
+  });
+
+  test('ingestion tracking table: CMK, PITR, TTL; Lambda limited to batch get/write', () => {
+    template.hasResourceProperties('AWS::DynamoDB::GlobalTable', {
+      SSESpecification: { SSEEnabled: true, SSEType: 'KMS' },
+      TimeToLiveSpecification: { AttributeName: 'expiresAt', Enabled: true },
+      Replicas: [Match.objectLike({ PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true } })],
+    });
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({ Sid: 'TrackProcessedChanges', Action: ['dynamodb:BatchGetItem', 'dynamodb:BatchWriteItem'] }),
+          Match.objectLike({ Sid: 'UseKeyViaDynamoDb', Condition: { StringEquals: { 'kms:ViaService': 'dynamodb.eu-west-2.amazonaws.com' } } }),
+        ]),
+      },
+    });
+  });
+
   test('app clients use client credentials only, with generated secrets', () => {
     template.hasResourceProperties('AWS::Cognito::UserPoolClient', {
       GenerateSecret: true,
@@ -200,7 +260,7 @@ describe('KbStack (VPC, generation via inference profile, guardrail, execution l
       guardrailId: 'abc123',
       guardrailVersion: '1',
     },
-    api: { executionLogging: true, clients: [{ name: 'agent', scopes: ['retrieve', 'ask'] }] },
+    api: { executionLogging: true, clients: [{ name: 'agent', scopes: ['retrieve', 'ask'], accessGroups: ['general'] }] },
   });
   const { template, app } = synth(config);
 
@@ -227,10 +287,15 @@ describe('KbStack (VPC, generation via inference profile, guardrail, execution l
     });
   });
 
-  test('isolated VPC with Bedrock PrivateLink endpoints and no NAT', () => {
+  test('isolated VPC with PrivateLink endpoints (Bedrock, EventBridge), DynamoDB gateway endpoint and no NAT', () => {
     template.resourceCountIs('AWS::EC2::NatGateway', 0);
     template.resourceCountIs('AWS::EC2::InternetGateway', 0);
-    template.resourceCountIs('AWS::EC2::VPCEndpoint', 2);
+    template.resourceCountIs('AWS::EC2::VPCEndpoint', 4);
+    template.hasResourceProperties('AWS::EC2::VPCEndpoint', { ServiceName: 'com.amazonaws.eu-west-2.events', VpcEndpointType: 'Interface' });
+    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
+      VpcEndpointType: 'Gateway',
+      PolicyDocument: { Statement: [Match.objectLike({ Action: ['dynamodb:BatchGetItem', 'dynamodb:BatchWriteItem'] })] },
+    });
     template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
       ServiceName: 'com.amazonaws.eu-west-2.bedrock-agent-runtime',
       PrivateDnsEnabled: true,

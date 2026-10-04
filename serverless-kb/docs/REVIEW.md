@@ -16,10 +16,11 @@ handlers, configuration, tests and scripts.
 review. The items in the [pre-production checklist](#4-pre-production-checklist)
 must be confirmed on the first real deployment.
 
-**Overall:** suitable for a **pilot with a single trust domain**, meaning all
-callers may see all indexed documents, once the checklist is complete. Before
-onboarding multiple data owners or tenants, resolve finding **S-07**
-(document-level authorization).
+**Overall:** suitable for a pilot once the checklist is complete. Since the
+alignment pass ([section 6](#6-alignment-re-review)), every query is scoped to
+access groups carried in the token, so the original blocker for multiple data
+owners (**S-07**) is resolved. What remains is mostly about trusting the
+gateway's user-to-group mapping, which lives outside this service.
 
 Severity: **High** means it breaks deployment or exposes data. **Medium** means
 it weakens a control or causes operational failure. **Low** covers hygiene and
@@ -61,7 +62,8 @@ hardening.
   timeout. This logic is unit-tested.
 - **Error mapping** gives 400, 429 or 500 without leaking internals. ARNs and
   bucket names never reach callers; S3 URIs are reduced to object keys.
-- **Tests (66)** cover handlers with a mocked SDK, config, and infrastructure
+- **Tests (105)** cover handlers with a mocked SDK (REST, MCP, scoping,
+  audit, budget, idempotency), config, the eval metrics, and infrastructure
   assertions in two configurations. cdk-nag is enforced in tests as well as at
   synth.
 
@@ -117,7 +119,7 @@ Trust boundaries:
 
 | ID | Sev | Finding | Recommendation |
 |---|---|---|---|
-| S-07 | **High** (before multi-tenant use) | **No document-level authorization.** Any client with the `retrieve` scope can retrieve every indexed chunk. That is fine for a single trust domain, but not otherwise. | Before onboarding a second data owner: tag documents with an owner or classification in `.metadata.json`, map Cognito clients to allowed values (custom scopes or a lookup), and have the Lambda **force** a filter derived from the token, which callers can't override. Alternatively, run a separate KB per domain. |
+| S-07 | ~~High~~ **Resolved** | ~~No document-level authorization.~~ Fixed in the alignment pass: documents carry `access_group`, tokens carry `group:<name>` scopes as a ceiling, and retrieval always applies `access_group IN (effective groups)`. Callers can narrow but never widen, and can't filter on the access key. | See A-03 for the remaining trust in the gateway's mapping. |
 | S-08 | Medium | **Indirect prompt injection is mitigated, not eliminated.** Poisoned documents still reach agents through `/retrieve`, where the *caller's* model consumes them. | Set `writerPrincipalArns`. Treat `/retrieve` output as untrusted in every consuming agent (document this in agent guidelines). Enable a Guardrail with prompt-attack filters on `/ask`. Consider an ingestion-time scan (for example Macie for PII, or a content check) for high-risk sources. |
 | S-09 | Medium | **Single CMK with the default key policy**, which delegates to account IAM, so any admin with `kms:*` can use it. It covers documents, vectors, queues and logs. | For production, separate a **data key** (S3, S3 Vectors) from an **ops key** (logs, SQS, SNS). Restrict key administration to a named role and usage to the workload roles. Consider an SCP that denies `kms:ScheduleKeyDeletion` and `kms:DisableKey`. |
 | S-10 | Medium | **No vector bucket policy.** Access to S3 Vectors relies on IAM alone, so another principal with broad `s3vectors:*` could read embeddings and chunk text directly. | Add an `AWS::S3Vectors::VectorBucketPolicy` that denies data-plane actions (`GetVectors`, `QueryVectors`, `ListVectors`) to everyone except the KB service role and a break-glass role. Or enforce this with an SCP or permission boundary. |
@@ -177,3 +179,67 @@ construct and given a written reason:
 - **Opt-in execution logging:** `APIG6`. Access logs are always on.
 - **Endpoint security group:** `EC23`. nag can't evaluate the SG-to-SG
   reference.
+
+---
+
+## 6. Alignment re-review
+
+The full design chat places this service behind an in-house **gateway**:
+- The gateway handles identity passthrough and per-query scoping.
+- Its Aurora MySQL store holds the permission model and the audit log of the
+  context each agent saw.
+- The gateway sits in front of the orchestrator's **gather-context** node,
+  which uses a token budget and talks over MCP.
+- **DynamoDB** handles orchestration state and ingestion idempotency.
+- A 30–50 question **evaluation baseline** comes before adding more
+  components.
+- **London versus EU inference** is a data-assurance concern.
+
+The changes for that were reviewed again with the same method: code read,
+synthesized-template inspection, cdk-nag in both configurations, tests.
+
+### 6.1 Requirement traceability
+
+| Design-chat requirement | Implementation | Evidence |
+|---|---|---|
+| Pass the caller's identity through; scope every query | `X-On-Behalf-Of` / `X-Access-Groups` contract. Token group scopes form the ceiling, with a mandatory `access_group IN (…)` filter. | `src/core/access.ts`, query tests ("narrows but can never widen", "delegating tokens must…") |
+| Map group IDs to teams or classifications | `access.groups`, one OAuth scope per group, the same names as Graphiti group IDs | `query-api.ts`, stack test "access groups become OAuth scopes" |
+| Log what context each agent saw (audit in Aurora MySQL) | `ContextServed` events (ids, source keys, chunk ids, scores; no text) to a CMK-encrypted, archived bus for the gateway's MySQL consumer. Fails closed. | `src/core/audit.ts`, `audit-trail.ts`, tests "records a ContextServed…" and "fails closed" |
+| Trim to a token budget before workers run | `maxTokens` per request (highest score first), with `usage` in the response | `fitToBudget`, test "trims results to the token budget" |
+| Talk to components over MCP (swappable) | Stateless MCP endpoint `/v1/mcp` with `search_documents` / `ask_documents` | `src/core/mcp.ts`, MCP tests |
+| DynamoDB idempotency keys for ingestion | `TrackingTable` (CMK, PITR, TTL); duplicates skipped; change → job traceability | `ingest.ts`, ingest tests |
+| 30–50 question evaluation vs plain RAG | `npm run eval` (hit@k, MRR, p50/p95, baseline diff); question sets git-ignored | `scripts/eval*.ts`, `test/eval-lib.test.ts` |
+| London vs EU cross-region inference | `generation.allowedInferenceGeographies` (default `eu`), checked at synth | config tests "a global / US inference profile by default" |
+| No PostgreSQL; DynamoDB, Aurora MySQL, Neptune and S3 estate | This service uses S3, S3 Vectors, DynamoDB and EventBridge only. MySQL and Neptune belong to the gateway and Graphiti. | `docs/PLAN.md` §1a |
+| Watch the extraction bill | No LLM extraction on this route: embeddings only, incremental sync. Cost note in README. | README "Operations" |
+
+### 6.2 Findings
+
+| ID | Sev | Finding | Status / recommendation |
+|---|---|---|---|
+| A-01 | Medium | If the gateway forgot `X-Access-Groups`, the user would silently receive the gateway's **full group ceiling**. | **Fixed.** Delegating clients get a `delegated` scope, and requests without both identity headers are rejected (400). Tested. |
+| A-02 | High | The L2 EventBridge `Archive` made the key policy reference the bus ARN, creating a **KMS key ↔ bus dependency cycle** that would block deployment. | **Fixed.** The bus has an explicit name, and the archive and its key grant are declared with a literal ARN and conditioned on account and encryption context. |
+| A-03 | Medium | This service **trusts the gateway's narrowing**. It enforces the ceiling but can't verify that `user-123` really belongs to `finance`. | Keep each gateway client's ceiling as small as its population allows. Reconcile the audit events (`onBehalfOf`, `accessGroups`) against the MySQL permission model periodically. Longer term, consider having the gateway pass a signed user assertion (a JWT from the IdP) for this service to verify. |
+| A-04 | Medium | Documents **without `access_group` are invisible** (deny by default). That is safe, but a missing metadata file shows up as silently poor recall. | Add an ingestion-time check (the S3 event triggers a validation that `<doc>.metadata.json` exists with a known group), and rely on the eval set to catch misses. |
+| A-05 | Low | Audit events contain `onBehalfOf` (personal data, kept 400 days). `queryHash` is a plain SHA-256, so a short or low-entropy query could be confirmed by guessing. | Cover both in the DPIA. If query confidentiality matters, switch to an HMAC with a secret key (Secrets Manager). Align archive retention with the MySQL audit retention. |
+| A-06 | Low | The MCP server is a **minimal, hand-rolled** implementation: stateless, JSON-only, no batching, protocol versions `2025-06-18` and `2025-03-26`. It is unit-tested but not yet exercised by a real MCP client. | Add a post-deploy contract test with the official MCP SDK client (initialize, list, call). Track spec revisions. |
+| A-07 | Low | Fail-closed audit adds a `PutEvents` call (tens of ms) and makes EventBridge a hard dependency. | Accepted for governance; the API 5xx alarm covers it. `audit.failClosed: false` exists for non-sensitive corpora. |
+| A-08 | Info | The token budget is estimated at about 4 characters per token. | The orchestrator should still apply its exact budget across all sources (documents and Graphiti). |
+| A-09 | Low | Ingestion idempotency is **best effort**: DynamoDB errors never block ingestion. | Accepted. The worst case is an extra incremental sync, which doesn't re-embed unchanged documents. |
+
+### 6.3 Added to the pre-production checklist
+
+8. **S3 Vectors filtering:**
+   - Upload two documents in different groups.
+   - Confirm that a token for one group never sees the other, through REST
+     and through MCP.
+   - Confirm that a document without `access_group` is never returned.
+9. **Delegated gateway client:** a call without `X-On-Behalf-Of` or
+   `X-Access-Groups` returns 400.
+10. **Audit:** `ContextServed` events appear in the archive, contain no query
+    or document text, and stopping the bus target doesn't affect delivery to
+    the archive.
+11. **MCP:** connect with a real MCP client (for example the MCP Inspector)
+    using a bearer token, then list and call tools.
+12. **Evaluation baseline:** create `eval/questions.jsonl` (30–50 questions),
+    run `npm run eval`, and store the baseline result outside git.

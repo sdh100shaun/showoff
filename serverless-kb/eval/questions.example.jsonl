@@ -1,0 +1,3 @@
+{"id": "travel-001", "question": "How many days in advance must international travel be approved?", "expectedSources": ["documents/policies/travel-policy.pdf"], "accessGroups": ["general"]}
+{"id": "expenses-002", "question": "What is the per-night hotel limit in London?", "expectedSources": ["documents/policies/expenses.pdf", "documents/policies/travel-policy.pdf"], "accessGroups": ["finance"]}
+{"id": "leave-003", "question": "Who approves carry-over of annual leave?", "expectedSources": ["documents/hr/leave-guidance.docx"], "accessGroups": ["hr"]}

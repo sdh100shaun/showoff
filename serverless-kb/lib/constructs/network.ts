@@ -11,18 +11,22 @@ export interface NetworkProps {
   readonly key: kms.IKey;
   readonly logRetention: logs.RetentionDays;
   readonly removalPolicy: RemovalPolicy;
+  /** Create an EventBridge endpoint (needed when audit events are enabled). */
+  readonly eventBridgeEndpoint: boolean;
 }
 
 /**
  * Optional private network: isolated subnets (no internet, no NAT) with
- * PrivateLink interface endpoints for the Bedrock APIs the Lambdas call.
- * Lambda logging and SQS polling are performed by the Lambda service, so no
- * further endpoints are required.
+ * PrivateLink interface endpoints for the APIs the Lambdas call (Bedrock,
+ * EventBridge for audit events) and a gateway endpoint for DynamoDB. Lambda
+ * logging and SQS polling are performed by the Lambda service, so no further
+ * endpoints are required.
  */
 export class Network extends Construct {
   public readonly vpc: ec2.Vpc;
   public readonly lambdaSecurityGroup: ec2.SecurityGroup;
-  private readonly endpoints: ec2.InterfaceVpcEndpoint[] = [];
+  private readonly endpoints = new Map<string, ec2.InterfaceVpcEndpoint>();
+  private dynamoDbEndpoint: ec2.GatewayVpcEndpoint;
 
   constructor(scope: Construct, id: string, props: NetworkProps) {
     super(scope, id);
@@ -61,9 +65,11 @@ export class Network extends Construct {
     const services: Record<string, ec2.InterfaceVpcEndpointAwsService> = {
       BedrockAgentRuntime: ec2.InterfaceVpcEndpointAwsService.BEDROCK_AGENT_RUNTIME,
       BedrockAgent: ec2.InterfaceVpcEndpointAwsService.BEDROCK_AGENT,
+      ...(props.eventBridgeEndpoint ? { EventBridge: ec2.InterfaceVpcEndpointAwsService.EVENTBRIDGE } : {}),
     };
     for (const [name, service] of Object.entries(services)) {
-      this.endpoints.push(
+      this.endpoints.set(
+        name,
         this.vpc.addInterfaceEndpoint(name, {
           service,
           privateDnsEnabled: true,
@@ -72,29 +78,33 @@ export class Network extends Construct {
         }),
       );
     }
+
+    // Gateway endpoint (no hourly cost) for the ingestion tracking table.
+    this.dynamoDbEndpoint = this.vpc.addGatewayEndpoint('DynamoDb', {
+      service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
+      subnets: [{ subnetType: ec2.SubnetType.PRIVATE_ISOLATED }],
+    });
+    // The DynamoDB gateway endpoint is reached by route, not by security group.
+    // The subnets have no internet or NAT route, so HTTPS egress can only
+    // reach the VPC endpoints.
+    this.lambdaSecurityGroup.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS to VPC endpoints only (no internet route)');
   }
 
-  /** Restrict the endpoints to this account's principals acting on one knowledge base. */
-  public restrictEndpointsTo(knowledgeBaseArn: string): void {
+  /** Restrict every endpoint to this account's principals acting on this stack's resources. */
+  public restrictEndpointsTo(resources: { knowledgeBaseArn: string; trackingTableArn: string; auditBusArn?: string }): void {
     const { account } = Stack.of(this);
-    for (const endpoint of this.endpoints) {
-      endpoint.addToPolicy(
-        new iam.PolicyStatement({
-          principals: [new iam.AnyPrincipal()],
-          actions: ['bedrock:Retrieve', 'bedrock:StartIngestionJob', 'bedrock:ListIngestionJobs'],
-          resources: [knowledgeBaseArn],
-          conditions: { StringEquals: { 'aws:PrincipalAccount': account } },
-        }),
-      );
+    const inAccount = { StringEquals: { 'aws:PrincipalAccount': account } };
+    const allow = (endpoint: ec2.IVpcEndpoint & { addToPolicy(s: iam.PolicyStatement): void }, actions: string[], arns: string[]) =>
+      endpoint.addToPolicy(new iam.PolicyStatement({ principals: [new iam.AnyPrincipal()], actions, resources: arns, conditions: inAccount }));
+
+    for (const name of ['BedrockAgentRuntime', 'BedrockAgent']) {
+      const endpoint = this.endpoints.get(name)!;
+      allow(endpoint, ['bedrock:Retrieve', 'bedrock:StartIngestionJob', 'bedrock:ListIngestionJobs'], [resources.knowledgeBaseArn]);
       // RetrieveAndGenerate has no resource type, so it can only be scoped by principal.
-      endpoint.addToPolicy(
-        new iam.PolicyStatement({
-          principals: [new iam.AnyPrincipal()],
-          actions: ['bedrock:RetrieveAndGenerate'],
-          resources: ['*'],
-          conditions: { StringEquals: { 'aws:PrincipalAccount': account } },
-        }),
-      );
+      allow(endpoint, ['bedrock:RetrieveAndGenerate'], ['*']);
     }
+    const eventBridge = this.endpoints.get('EventBridge');
+    if (eventBridge && resources.auditBusArn) allow(eventBridge, ['events:PutEvents'], [resources.auditBusArn]);
+    allow(this.dynamoDbEndpoint, ['dynamodb:BatchGetItem', 'dynamodb:BatchWriteItem'], [resources.trackingTableArn]);
   }
 }

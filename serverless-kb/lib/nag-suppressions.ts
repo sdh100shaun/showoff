@@ -1,6 +1,6 @@
 import { Stack, Token, Validations } from 'aws-cdk-lib';
 import { IConstruct } from 'constructs';
-import { KbConfig } from './config';
+import { baseModelId, KbConfig } from './config';
 import { KbStack } from './kb-stack';
 
 const BASIC_EXECUTION_ROLE = 'AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]';
@@ -29,7 +29,7 @@ export function applyNagSuppressions(stack: KbStack, config: KbConfig): void {
   if (config.generation.inferenceProfile) {
     ack(
       stack.queryApi.function.fn.role?.node.tryFindChild('DefaultPolicy'),
-      `AwsSolutions::AwsSolutions-IAM5[Resource::arn:${partitionOf(stack)}:bedrock:*::foundation-model/${baseModel(config.generation.modelId)}]`,
+      `AwsSolutions::AwsSolutions-IAM5[Resource::arn:${partitionOf(stack)}:bedrock:*::foundation-model/${baseModelId(config.generation.modelId ?? '')}]`,
       'Cross-region inference profiles route to the base model in several regions; the statement is conditioned on bedrock:InferenceProfileArn equal to this one profile.',
     );
   }
@@ -89,8 +89,4 @@ function logicalIdOf(stack: Stack, construct: IConstruct): string {
 
 function partitionOf(stack: Stack): string {
   return Token.isUnresolved(stack.partition) ? '<AWS::Partition>' : stack.partition;
-}
-
-function baseModel(modelId: string | undefined): string {
-  return (modelId ?? '').replace(/^(us|eu|apac|us-gov|ca|jp|au|global)\./, '');
 }

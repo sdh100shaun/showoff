@@ -14,7 +14,8 @@
     "synth": "cdk synth --quiet",
     "deploy": "cdk deploy",
     "check:secrets": "bash scripts/check-secrets.sh",
-    "verify": "npm run build && npm run lint && npm test && npm run check:secrets"
+    "verify": "npm run build && npm run lint && npm test && npm run check:secrets",
+    "eval": "ts-node scripts/eval.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -39,6 +40,8 @@
     "@aws-lambda-powertools/logger": "^2.35.0",
     "@aws-sdk/client-bedrock-agent": "^3.1146.0",
     "@aws-sdk/client-bedrock-agent-runtime": "^3.1146.0",
+    "@aws-sdk/client-dynamodb": "^3.1146.0",
+    "@aws-sdk/client-eventbridge": "^3.1146.0",
     "zod": "^4.6.5"
   }
 }
