@@ -1,0 +1,3 @@
+process.env.KNOWLEDGE_BASE_ID = 'KBTEST1234';
+process.env.DATA_SOURCE_ID = 'DSTEST1234';
+process.env.POWERTOOLS_LOG_LEVEL = 'SILENT';
