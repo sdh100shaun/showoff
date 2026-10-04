@@ -42,12 +42,13 @@ export class Encryption extends Construct {
       }),
     );
 
-    // EventBridge delivering S3 events into the encrypted SQS queue, and
-    // CloudWatch alarms publishing to the encrypted SNS topic.
+    // CloudWatch alarms publishing to the encrypted SNS topic. (The EventBridge
+    // grant for the encrypted queue is added by the SqsQueue target, scoped to
+    // this account by the eventsTargetQueueSameAccount feature flag.)
     this.key.addToResourcePolicy(
       new iam.PolicyStatement({
-        sid: 'AllowEventBridgeAndCloudWatchToEncryptedTargets',
-        principals: [new iam.ServicePrincipal('events.amazonaws.com'), new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
+        sid: 'AllowCloudWatchAlarmsToEncryptedTopic',
+        principals: [new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
         actions: ['kms:GenerateDataKey*', 'kms:Decrypt'],
         resources: ['*'],
         conditions: { StringEquals: { 'aws:SourceAccount': account } },

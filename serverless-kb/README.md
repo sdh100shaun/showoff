@@ -64,6 +64,7 @@ Key settings (see `lib/config.ts` for all of them, with documentation):
 |---|---|---|
 | `removalPolicy` | `retain` | Use `destroy` only for disposable environments |
 | `documents.prefix` | `documents/` | Only objects under this prefix are indexed |
+| `documents.writerPrincipalArns` | `[]` | Recommended: only these roles may write or delete documents |
 | `knowledgeBase.embeddingModelId` / `embeddingDimensions` | Titan v2 / 1024 | Changing either replaces the index |
 | `knowledgeBase.chunking` | fixed 300 tokens, 20% overlap | `FIXED_SIZE`, `SEMANTIC` or `NONE` |
 | `ingestion.batchWindowSeconds` | 60 | Debounce for bursts of uploads |

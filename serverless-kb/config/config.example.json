@@ -6,7 +6,8 @@
   "removalPolicy": "destroy",
   "documents": {
     "prefix": "documents/",
-    "noncurrentVersionExpirationDays": 30
+    "noncurrentVersionExpirationDays": 30,
+    "writerPrincipalArns": []
   },
   "knowledgeBase": {
     "embeddingModelId": "amazon.titan-embed-text-v2:0",

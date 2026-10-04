@@ -1,4 +1,5 @@
 import { Stack } from 'aws-cdk-lib';
+import { createHash } from 'crypto';
 import * as bedrock from 'aws-cdk-lib/aws-bedrock';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
@@ -74,8 +75,12 @@ export class KnowledgeBase extends Construct {
     });
     policy.attachToRole(this.role);
 
+    // Changing the embedding model, dimensions or vector index replaces the
+    // knowledge base. CloudFormation creates the replacement before deleting the
+    // old one, so the name must change too: suffix a hash of those settings.
+    const kbVersion = shortHash([settings.embeddingModelId, settings.embeddingDimensions, settings.distanceMetric]);
     this.knowledgeBase = new bedrock.CfnKnowledgeBase(this, 'KnowledgeBase', {
-      name: `${Stack.of(this).stackName}-kb`,
+      name: `${Stack.of(this).stackName}-kb-${kbVersion}`,
       description: props.description,
       roleArn: this.role.roleArn,
       knowledgeBaseConfiguration: {
@@ -100,7 +105,8 @@ export class KnowledgeBase extends Construct {
 
     this.dataSource = new bedrock.CfnDataSource(this, 'DocumentsDataSource', {
       knowledgeBaseId: this.knowledgeBase.attrKnowledgeBaseId,
-      name: 'documents',
+      // Chunking changes replace the data source; same naming rule as above.
+      name: `documents-${shortHash([settings.chunking, props.documentPrefix])}`,
       description: 'S3 document prefix',
       dataDeletionPolicy: settings.dataDeletionPolicy,
       dataSourceConfiguration: {
@@ -121,6 +127,11 @@ export class KnowledgeBase extends Construct {
   public get knowledgeBaseArn(): string {
     return this.knowledgeBase.attrKnowledgeBaseArn;
   }
+}
+
+/** Stable 8-character hash of replacement-triggering settings. */
+export function shortHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 8);
 }
 
 function chunkingConfiguration(c: KbConfig['knowledgeBase']['chunking']): bedrock.CfnDataSource.ChunkingConfigurationProperty {

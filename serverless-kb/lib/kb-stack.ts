@@ -55,6 +55,7 @@ export class KbStack extends Stack {
       removalPolicy,
       noncurrentVersionExpirationDays: config.documents.noncurrentVersionExpirationDays,
       accessLogExpirationDays: config.documents.accessLogExpirationDays,
+      writerPrincipalArns: config.documents.writerPrincipalArns,
     });
 
     this.vectors = new VectorStore(this, 'VectorStore', {

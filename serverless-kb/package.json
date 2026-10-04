@@ -4,9 +4,6 @@
   "private": true,
   "description": "Serverless RAG retrieval service: S3 documents, Amazon Bedrock Knowledge Bases, Amazon S3 Vectors (AWS CDK, TypeScript)",
   "license": "MIT",
-  "bin": {
-    "serverless-kb": "bin/app.js"
-  },
   "engines": {
     "node": ">=22"
   },

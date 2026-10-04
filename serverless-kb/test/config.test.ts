@@ -57,6 +57,8 @@ describe('loadConfig', () => {
   test.each([
     ['unknown top-level key', { surprise: true }, /Unrecognized key|unrecognized/i],
     ['bad account', { account: '123' }, /12-digit/],
+    ['double hyphen in project name', { projectName: 'kb--pilot' }, /single hyphens/],
+    ['non-ARN document writer', { documents: { writerPrincipalArns: ['admin'] } }, /IAM role\/user ARN/],
     ['bad region', { region: 'london' }, /region/],
     ['prefix without slash', { documents: { prefix: 'docs' } }, /ending in \//],
     ['generation without model', { generation: { enabled: true } }, /modelId is required/],

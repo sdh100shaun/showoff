@@ -9,6 +9,8 @@ export interface DocumentStoreProps {
   readonly removalPolicy: RemovalPolicy;
   readonly noncurrentVersionExpirationDays: number;
   readonly accessLogExpirationDays: number;
+  /** When non-empty, only these principals may write or delete documents. */
+  readonly writerPrincipalArns: string[];
 }
 
 /** S3 bucket holding the source documents that the knowledge base indexes. */
@@ -80,5 +82,20 @@ export class DocumentStore extends Construct {
         },
       }),
     );
+
+    // Documents become model context, so write access is a prompt-injection
+    // path. Optionally restrict writers to an explicit allow-list.
+    if (props.writerPrincipalArns.length > 0) {
+      this.bucket.addToResourcePolicy(
+        new iam.PolicyStatement({
+          sid: 'DenyWritesExceptAllowedWriters',
+          effect: iam.Effect.DENY,
+          principals: [new iam.AnyPrincipal()],
+          actions: ['s3:PutObject', 's3:DeleteObject', 's3:DeleteObjectVersion', 's3:RestoreObject', 's3:PutObjectTagging'],
+          resources: [this.bucket.arnForObjects('*')],
+          conditions: { ArnNotLike: { 'aws:PrincipalArn': props.writerPrincipalArns } },
+        }),
+      );
+    }
   }
 }

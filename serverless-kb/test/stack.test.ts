@@ -116,7 +116,8 @@ describe('KbStack (default configuration)', () => {
       Scope: 'REGIONAL',
       Rules: Match.arrayWith([Match.objectLike({ Name: 'RateLimitPerIp', Statement: { RateBasedStatement: { Limit: 500, AggregateKeyType: 'IP' } } })]),
     });
-    template.resourceCountIs('AWS::WAFv2::WebACLAssociation', 1);
+    // API stage and Cognito user pool (token endpoint).
+    template.resourceCountIs('AWS::WAFv2::WebACLAssociation', 2);
     template.hasResourceProperties('AWS::WAFv2::LoggingConfiguration', {
       RedactedFields: [{ SingleHeader: { Name: 'authorization' } }],
     });
@@ -133,6 +134,15 @@ describe('KbStack (default configuration)', () => {
     expect(policies).not.toContain('"bedrock:*"');
   });
 
+  test('knowledge base and data source names carry a settings hash (safe replacement)', () => {
+    template.hasResourceProperties('AWS::Bedrock::KnowledgeBase', { Name: Match.stringLikeRegexp('^Test-kb-[0-9a-f]{8}$') });
+    template.hasResourceProperties('AWS::Bedrock::DataSource', { Name: Match.stringLikeRegexp('^documents-[0-9a-f]{8}$') });
+  });
+
+  test('no writer allow-list unless configured', () => {
+    expect(JSON.stringify(template.findResources('AWS::S3::BucketPolicy'))).not.toContain('DenyWritesExceptAllowedWriters');
+  });
+
   test('all log groups are KMS-encrypted with retention', () => {
     const groups = template.findResources('AWS::Logs::LogGroup');
     expect(Object.keys(groups).length).toBeGreaterThan(0);
@@ -140,6 +150,20 @@ describe('KbStack (default configuration)', () => {
       expect(g.Properties.KmsKeyId).toBeDefined();
       expect(g.Properties.RetentionInDays).toBe(90);
     }
+  });
+
+  test('EventBridge may only use the queue and key on behalf of this account', () => {
+    template.hasResourceProperties('AWS::SQS::QueuePolicy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({ Principal: { Service: 'events.amazonaws.com' }, Condition: { StringEquals: { 'aws:SourceAccount': '111111111111' } } }),
+        ]),
+      },
+    });
+    const key = Object.values(template.findResources('AWS::KMS::Key'))[0]!;
+    const serviceStatements = (key.Properties.KeyPolicy.Statement as { Principal: { Service?: unknown }; Condition?: unknown }[]).filter((s) => s.Principal.Service);
+    expect(serviceStatements.length).toBeGreaterThan(0);
+    for (const s of serviceStatements) expect(s.Condition).toBeDefined();
   });
 
   test('queues are KMS-encrypted with a DLQ', () => {
@@ -167,6 +191,7 @@ describe('KbStack (default configuration)', () => {
 
 describe('KbStack (VPC, generation via inference profile, guardrail, execution logging)', () => {
   const config = testConfig({
+    documents: { writerPrincipalArns: ['arn:aws:iam::111111111111:role/doc-publisher'] },
     network: { enableVpc: true },
     generation: {
       enabled: true,
@@ -213,6 +238,20 @@ describe('KbStack (VPC, generation via inference profile, guardrail, execution l
     });
     template.hasResourceProperties('AWS::Lambda::Function', { VpcConfig: Match.anyValue() });
     template.hasResourceProperties('AWS::EC2::FlowLog', { TrafficType: 'ALL' });
+  });
+
+  test('only allow-listed principals may write documents', () => {
+    template.hasResourceProperties('AWS::S3::BucketPolicy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Sid: 'DenyWritesExceptAllowedWriters',
+            Effect: 'Deny',
+            Condition: { ArnNotLike: { 'aws:PrincipalArn': ['arn:aws:iam::111111111111:role/doc-publisher'] } },
+          }),
+        ]),
+      },
+    });
   });
 
   test('execution logging enabled without data tracing', () => {

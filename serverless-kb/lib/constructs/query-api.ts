@@ -216,6 +216,12 @@ export class QueryApi extends Construct {
         resourceArn: this.restApi.deploymentStage.stageArn,
         webAclArn: this.webAcl.attrArn,
       });
+      // The OAuth2 token endpoint is public too: rate-limit it to slow
+      // client-secret guessing.
+      new wafv2.CfnWebACLAssociation(this, 'UserPoolWebAclAssociation', {
+        resourceArn: this.userPool.userPoolArn,
+        webAclArn: this.webAcl.attrArn,
+      });
     }
 
     new CfnOutput(stack, 'ApiUrl', { value: this.restApi.url, description: 'Base URL of the retrieval API' });

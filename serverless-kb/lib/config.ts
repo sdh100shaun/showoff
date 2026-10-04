@@ -32,9 +32,13 @@ const chunkingSchema = z.discriminatedUnion('strategy', [
 export const configSchema = z
   .object({
     /** Short lowercase name used to prefix the stack and resource tags. */
-    projectName: z.string().regex(/^[a-z][a-z0-9-]{1,30}$/, 'lowercase letters, digits and hyphens, 2-31 chars'),
+    projectName: z
+      .string()
+      .min(2)
+      .max(31)
+      .regex(/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/, 'lowercase letters and digits, single hyphens between words'),
     /** Environment name, e.g. dev / test / prod. */
-    envName: z.string().regex(/^[a-z][a-z0-9-]{0,15}$/),
+    envName: z.string().max(16).regex(/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/),
     /** Optional: defaults to CDK_DEFAULT_ACCOUNT (from your AWS credentials). */
     account: accountId.optional(),
     /** Optional: defaults to CDK_DEFAULT_REGION. Confirm S3 Vectors + Bedrock KB availability first. */
@@ -48,6 +52,16 @@ export const configSchema = z
         prefix: z.string().regex(/^[A-Za-z0-9!_.*'()\-/]+\/$/, 'must be a simple key prefix ending in /').default('documents/'),
         noncurrentVersionExpirationDays: z.number().int().min(1).max(3650).default(30),
         accessLogExpirationDays: z.number().int().min(1).max(3650).default(365),
+        /**
+         * IAM role/user ARNs allowed to write or delete documents. When set, every
+         * other principal is denied (documents become trusted model context, so
+         * write access is a prompt-injection path). Keep real ARNs in your
+         * git-ignored config. Empty = rely on IAM alone.
+         */
+        writerPrincipalArns: z
+          .array(z.string().regex(/^arn:aws[a-z-]*:(iam|sts)::\d{12}:(role|user|assumed-role)\/[\w+=,.@/*-]+$/, 'must be an IAM role/user ARN'))
+          .max(20)
+          .default([]),
       })
       .prefault({}),
 
