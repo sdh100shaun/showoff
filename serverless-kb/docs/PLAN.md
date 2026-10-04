@@ -32,6 +32,91 @@ Accepted trade-offs (from the discussion):
   (London). Check the S3 Vectors and Bedrock KB regional availability pages
   before deploying. The region is configuration, never hard-coded.
 
+## 1a. Alignment with the target architecture (from the full design chat)
+
+This service is **one component** of the wider agent platform. It replaces
+Cognee on the *document* side (Route 2). It is not the whole platform.
+
+```
+           ┌──────────────── Orchestrator (LangGraph, Fargate) ────────────────┐
+request ──►│ gather-context node ──► trim to token budget ──► worker agents ──► │──► write-back episode
+           └──────┬───────────────────────────────┬────────────────────────────┘        (Graphiti)
+                  │ MCP / HTTPS + caller identity  │
+           ┌──────▼──────── Gateway (built in-house) ──────────────────────────┐
+           │ authN, map user/team → access groups (Aurora MySQL),               │
+           │ scope every query, audit what context each agent saw               │
+           └──────┬───────────────────────────────┬────────────────────────────┘
+                  │                               │
+        ┌─────────▼─────────┐            ┌────────▼─────────┐
+        │ THIS SERVICE       │            │ Graphiti (phase 3)│
+        │ documents: S3 →    │            │ memory: Neptune/  │
+        │ Bedrock KB →       │            │ Neo4j             │
+        │ S3 Vectors         │            └───────────────────┘
+        └───────────────────┘
+```
+
+Where each store sits (no PostgreSQL anywhere):
+
+| Store | Holds | Owner |
+|---|---|---|
+| S3 + S3 Vectors + Bedrock KB | Documents, chunks, embeddings | **This service** |
+| DynamoDB | Ingestion job tracking and idempotency keys (TTL) | **This service** |
+| DynamoDB (+ S3 offload, TTL) | LangGraph checkpoints (`langgraph-checkpoint-aws` DynamoDBSaver) | Orchestrator |
+| Aurora MySQL | Permission model (users and teams → access groups / Graphiti group IDs), audit log of context served | Gateway (consumes this service's audit events) |
+| Neptune (or Neo4j) | Graphiti temporal memory | Phase 3 |
+
+What this service must provide so it fits that picture:
+
+1. **Identity passthrough and scoping on every query.** Each document carries
+   an `access_group` metadata attribute. Each API client is granted access
+   groups as OAuth scopes (`kb-api/group:<name>`), which form a ceiling
+   enforced by this service. The gateway passes the end user's identity
+   (`X-On-Behalf-Of`) and may **narrow** the groups per request
+   (`X-Access-Groups`), but can never widen them. Retrieval always applies a
+   mandatory `access_group IN (...)` filter that the caller can't override.
+   Documents without a group are never returned (deny by default). Group names
+   map 1:1 to teams or classifications, matching Graphiti group IDs.
+2. **An audit trail of what context each agent was given.** Every response
+   emits a `ContextServed` event (caller, on-behalf-of, agent/run/trace ids,
+   effective groups, query hash, and the source keys, chunk ids and scores
+   returned, but no text) to an encrypted EventBridge bus with an archive. The
+   gateway's Aurora MySQL audit tables (and Langfuse, via the trace id)
+   consume it. Delivery fails closed: if the audit event can't be written, no
+   context is returned.
+3. **A curated briefing, not raw hits.** An optional `maxTokens` budget on each
+   request trims results (highest score first) so the gather-context node can
+   allocate its budget across sources.
+4. **MCP as well as REST.** A stateless MCP (Streamable HTTP) endpoint at
+   `/v1/mcp` exposes `search_documents` (and `ask_documents` when generation is
+   on), with the same auth, scoping and audit. The orchestrator then talks to
+   documents the same way it talks to Graphiti, which keeps components
+   swappable.
+5. **Idempotent ingestion tracking.** A DynamoDB table (TTL) records the event
+   ids already handed to an ingestion job, and which job covered them. Retried
+   or duplicated messages don't start redundant jobs, and every change is
+   traceable to a job.
+6. **An evaluation baseline.** `npm run eval` scores retrieval (hit@k, MRR,
+   latency) against a git-ignored set of 30–50 questions with known source
+   documents. This is the plain-RAG baseline that a later Cognee or Graphiti
+   phase must beat.
+7. **Data residency guard.** Generation models are restricted to an allowed
+   inference geography (default `eu`, so `global.` or `us.` profiles are
+   rejected at synth), because London versus EU cross-region inference matters
+   for data assurance. Embeddings always run in-region.
+
+Phasing, mapped to the design chat:
+
+| Phase | Chat | Here |
+|---|---|---|
+| 1 | Start with one well-understood corpus | One KB, one data source; retrieve-only by default |
+| 2 | 30–50 question evaluation set vs plain RAG | `eval/` harness and baseline results |
+| 3 | Add Graphiti only when memory across runs is needed | Out of scope (separate service; same gateway/MCP pattern) |
+| 4 | Gateway permission model **before** sensitive data | Group scoping, the identity passthrough contract and audit events are built in now. The gateway's MySQL model consumes them. |
+
+Cost note from the chat: graph extraction is the hidden cost for Cognee and
+Graphiti. On this route the per-document cost is **embeddings only**, and
+Bedrock sync is incremental: only changed documents are re-embedded.
+
 ## 2. Architecture
 
 ```
@@ -187,12 +272,17 @@ serverless-kb/
 9. Run the review as a **developer** and as a **security architect**, write the
    findings to `docs/REVIEW.md`, and fix what is in scope.
 10. Commit and push.
+11. **Alignment pass** (section 1a): access-group scoping, audit events, the
+    token budget, MCP endpoint, DynamoDB ingestion tracking, the eval harness
+    and the residency guard, with tests, documentation and a re-review.
 
 ## 7. Out of scope for the pilot (future phases)
 
-- Knowledge graph memory (Graphiti/Cognee) and the Aurora MySQL integration.
+- Knowledge graph memory (Graphiti, phase 3) and Cognee's graph extraction.
 - Hybrid search (OpenSearch Serverless with an S3 Vectors engine).
-- Per-tenant document isolation (metadata-filter enforcement driven by token
-  claims). The design leaves room for it via the filter allow-list.
+- The gateway itself, with its Aurora MySQL permission model and audit tables
+  (this service provides the enforcement point and the audit event stream).
+- The orchestrator (LangGraph on Fargate, DynamoDBSaver checkpoints) and
+  Langfuse tracing.
 - A custom domain and certificate for the API. Optional config is stubbed only.
 - Multi-region DR.
